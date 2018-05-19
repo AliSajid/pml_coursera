@@ -11,7 +11,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ## Background
 
-This document is a report generated as a partial requirement fulfillment for the [Coursera](https://coursera.org) course [Practical Machine Learning](). This course is part of the [Data Science Specialization]() by the prestigious [John's Hopkins University's Bloomberg School of Public Health]().
+This document is a report generated as a partial requirement fulfillment for the [Coursera](https://coursera.org) course [Practical Machine Learning](https://www.coursera.org/learn/practical-machine-learning). This course is part of the [Data Science Specialization]() by the prestigious [John's Hopkins University's Bloomberg School of Public Health](https://www.jhsph.edu/).
 
 This report is generated in in R, utilizing the Rmd format for report's markup and R language for all the relevant calculations. The report generation process was considerably eased by RStudio and the associated knitr package.
 
@@ -23,7 +23,7 @@ Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible t
 
 One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. 
 
-More information is available from the website here: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har (see 
+More information is available from the website here: [http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har] (see the section on the Weight Lifting Exercise Dataset). 
 
 ## Dataset
 The data is provided as part of the project specification on Coursera's project page. It consists of two sections: `pml-training.csv` and `pml-testing.csv`. The files are available as downloads on Coursera's CDN and are also included in the `data` subdirectory in this repo.
@@ -44,4 +44,208 @@ if (!file.exists("data/pml-testing.csv")) {
 
 ```
 
+## Preparation and Data Inspection
+
+We will now load the desired libraries and inspect the data for its features.
+
+```{r preparation, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(caret)
+library(rattle)
+library(corrplot)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(RColorBrewer)
+
+set.seed(19900107)
+
+col_spec <- cols(
+  .default = col_double(),
+  user_name = col_character(),
+  cvtd_timestamp = col_character(),
+  new_window = col_character(),
+  classe = col_factor(levels = NULL)
+)
+
+total_training <- read_csv("data/pml-training.csv", na = c("NA","#DIV/0!",""), col_types = col_spec)
+
+total_testing <- read_csv("data/pml-testing.csv", na = c("NA","#DIV/0!",""), col_types = col_spec)
+
+in_training <- createDataPartition(total_training$classe, p = 0.75, list = FALSE)
+training_set <- total_training[in_training, ]
+testing_set <- total_training[-in_training, ]
+```
+
+From an initial inspection, the data seems to contain `r dim(total_testing)[2]` variables with the training and testing datasets having `r dim(total_training)[1]` and `r dim(total_testing)[1]` observations respectively. An initial review also tells us that many variables are either NA or mostly NA. All of this can help us whittle down our feature set for only the important ones.
+
+We have paritioned our _training_ dataset into two parts, with `r dim(training_set)[1]` observations in the training subset and `r dim(testing_set)[1]` in the testing subset. These are the sets that will be used to train and test the models that will eventually be applied to our testing dataset.
+
+## Data Cleaning
+
+To clean the data so only the necessary and valuable variables are retained, the following approach will be used:
+
+1. All variables that are _mostly_ NA (> 95%) will be removed as they would not add much information.
+1. All variables that have Zero or Near-Zero Variance will be removed as they would not add much in the way of variance and consequently will not add much information.
+1. All variables with identifying information and other metadata (timestamps etc.) will be removed as well.
+
+The end result at this stage will be a data set that contains the variables contributing the maximum variance to the dataset and the outcome variable _classe_.
+
+```{r data_cleaning}
+NZVars <- nearZeroVar(total_training)
+training_set <- testing_set[, -NZVars]
+testing_set <- testing_set[, -NZVars]
+
+AllNA    <- sapply(training_set, function(x) mean(is.na(x))) > 0.95
+training_set <- training_set[, AllNA == FALSE]
+testing_set <- testing_set[, AllNA == FALSE]
+
+training_set <- training_set[, -(1:5)]
+testing_set <- testing_set[, -(1:5)]
+```
+
+We can see that after the pruning of unnecessary features we are left with a manageable and informative `r dim(testing_set)[2]` variables.
+
+## Correlation Analysis
+
+Before any modelling is done, a simple correlational analysis will highlight significant correlations and help us decide if we should go for a Principal Component Analysis before model building.
+
+```{r correlation}
+correlation_matrix <- cor(training_set[, -54])
+
+corrplot(correlation_matrix, order = "FPC", method = "color", type = "lower", tl.cex = 0.6, tl.col = "black")
+```
+
+We can see quite a few highly correlated variables in the matrix above (signified by the darker color). However, the number of correlations is still not large enough that we go for PCA. We will proceed with the analysis as-is.
+
+## Model Building
+
+We will use three methods to model the relationship between the variables and the outcomes. Each method will be used to train a model on the _training\_set_ and their accuracy with out-of-sample error estimated using the _testing\_set_. The model with the best accuracy will be used to predict the classes for the quiz.
+
+The methods used will be:
+
+1. Decision Trees
+1. Generalized Boosted Models
+1. Random Forests
+
+Each model is followed by a confusion matrix to better visualize the accuracy.
+
+```{r helper_methods}
+
+jBuPuFun <- colorRampPalette(brewer.pal(n = 9, "BuPu"))
+paletteSize <- 256
+jBuPuPalette <- jBuPuFun(paletteSize)
+
+plot_confusion_matrix <- function(confusion_matrix) {
+  confusion_df <- as_tibble(confusion_matrix$table)
+  p <- ggplot(data = confusion_df, aes(x = Prediction, y = Reference, fill = n))
+  p + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    geom_tile() +
+    labs(x = "Predicted Class", y = "Actual Class") +
+    scale_fill_gradient2(
+        low = jBuPuPalette[1],
+        mid = jBuPuPalette[paletteSize/2],
+        high = jBuPuPalette[paletteSize],
+        midpoint = (max(confusion_df$n) + min(confusion_df$n)) / 2,
+        name = "") +
+    theme(legend.key.height = unit(2, "cm"))
+}
+
+```
+
+
+### Decision Trees
+
+Decision trees might be a good idea in this case as we have a lot of variables with numeric values. We do not expect accuracy to be too high but still _good enough_.
+
+```{r decision_trees_model}
+set.seed(19900107)
+
+mod_dt <- train(classe ~ ., method = "rpart", data = training_set)
+
+mod_dt$finalModel
+fancyRpartPlot(mod_dt$finalModel)
+```
+
+Next we do prediction on our testing dataset.
+
+```{r decision_trees_prediction}
+predicted_dt <- predict(mod_dt, newdata = testing_set)
+
+confmat_dt <- confusionMatrix(predicted_dt, testing_set$classe)
+
+plot_confusion_matrix(confmat_dt)
+```
+
+It is evident from the Confusion Matrix plot that this model is not very well performing. In fact, the accuracy of this model is `r confmat_dt$overall[1]` which is not really good at all.
+
+### Generalized Boosted Models
+
+Genearlized Boosted Models might be a good idea in this case as we have a lot of variables with numeric values. We expect accuracy to be high.
+
+```{r gbm_model}
+set.seed(19900107)
+
+control_gbm <- trainControl(method = "repeatedcv", number = 5, repeats = 1)
+mod_gbm  <- train(classe ~ ., data=training_set, method = "gbm",
+                    trControl = control_gbm, verbose = FALSE)
+mod_gbm$finalModel
+```
+
+Next we do prediction on our testing dataset.
+
+```{r gbm_prediction}
+predicted_gbm <- predict(mod_gbm, newdata = testing_set)
+
+confmat_gbm <- confusionMatrix(predicted_gbm, testing_set$classe)
+
+plot_confusion_matrix(confmat_gbm)
+```
+
+The Confusion Matrix plot from the Generalized Boosted Model is almost completely correct. It appears to have a very high accuracy and in fact the accuracy of this model is `r confmat_gbm$overall[1]` which is near perfect.
+
+### Random Forests
+
+Random Forests play well with a reasonable number of observations and variables and might be a good strategy here.
+
+```{r rf_model}
+set.seed(19900107)
+
+control_rf <- trainControl(method="cv", number=3, verboseIter=FALSE)
+mod_rf  <- train(classe ~ ., data=training_set, method = "rf",
+                    trControl = control_rf)
+mod_rf$finalModel
+```
+
+Next we do prediction on our testing dataset.
+
+```{r random_forest_prediction}
+predicted_rf <- predict(mod_rf, newdata = testing_set)
+
+confmat_rf <- confusionMatrix(predicted_rf, testing_set$classe)
+
+plot_confusion_matrix(confmat_rf)
+```
+
+The Confusion Matrix plot from the Random Forest model is near completely correct. It appears to have perfect accuracy and in fact the accuracy of this model is `r confmat_gbm$overall[1]` which is very close to perfect.
+
+### Final Decision
+
+Final results of accuracy are as follows:
+
+Decision Trees:\t\t `r confmat_dt$overall[1]`
+Generalized Boosted Model:\t\t `r confmat_gbm$overall[1]`
+Random Forest:\t\t `r confmat_rf$overall[1]`
+
+It is clear that Random Forest gives the far superior result of any of the approaches tried.
+
+
+## Predicting the Test Data
+
+We will now apply our selected model, i.e. Random Forest model to the testing data set and see how well it fares.
+
+```{r final_prediction}
+final_prediction <- predict(mod_rf, newdata = total_testing)
+final_prediction
+```
 
